@@ -188,7 +188,7 @@ public:
       if (strncmp(name.c_str(), "CFG", 3) != 0) {
         continue;
       }
-      RCLCPP_INFO(get_logger(), "parameter supplied: %s", name.c_str());
+      RCLCPP_DEBUG(get_logger(), "parameter supplied: %s", name.c_str());
       bool valid = parameter_manager_->is_valid_parameter(name);
       if (!valid) {
         RCLCPP_WARN(
@@ -492,13 +492,13 @@ private:
 
     if (!config_file_.empty()) {
       try {
-        RCLCPP_INFO(get_logger(), "Loading UBX config from file: %s", config_file_.c_str());
+        RCLCPP_DEBUG(get_logger(), "Loading UBX config from file: %s", config_file_.c_str());
         config_map = ubx::cfg::UbxConfigLoader::load_from_toml(
           config_file_, ubx::cfg::ubxKeyCfgItemMap);
         loaded_config_file_ = config_file_;
         loaded_config_family_ = ubx::cfg::UbxConfigLoader::get_toml_device_family(config_file_);
         config_loaded = true;
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           get_logger(), "Loaded %zu parameters from %s (family: %s)",
           config_map.size(), config_file_.c_str(), loaded_config_family_.c_str());
       } catch (const std::exception & e) {
@@ -513,7 +513,7 @@ private:
       try {
         std::string default_toml =
           ubx::cfg::UbxConfigLoader::get_default_toml_path(device_family_str_);
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           get_logger(), "Loading default UBX config for %s: %s",
           device_family_str_.c_str(), default_toml.c_str());
         config_map = ubx::cfg::UbxConfigLoader::load_from_toml(
@@ -521,7 +521,7 @@ private:
         loaded_config_file_ = default_toml;
         loaded_config_family_ = device_family_str_;
         config_loaded = true;
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           get_logger(), "Loaded %zu parameters from %s TOML",
           config_map.size(), device_family_str_.c_str());
       } catch (const std::exception & e) {
@@ -541,7 +541,7 @@ private:
         loaded_config_file_ = f9p_toml;
         loaded_config_family_ = "F9P";
         config_loaded = true;
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           get_logger(), "Loaded %zu parameters from F9P default TOML",
           config_map.size());
       } catch (const std::exception & e) {
@@ -690,7 +690,7 @@ private:
     config_file_ = param_client->get_parameter<std::string>(UBX_CONFIG_FILE_PARAM_NAME);
 
     if (!config_file_.empty()) {
-      RCLCPP_INFO(
+      RCLCPP_DEBUG(
         get_logger(), "UBX_CONFIG_FILE parameter set: %s", config_file_.c_str());
     } else {
       RCLCPP_DEBUG(
@@ -709,12 +709,12 @@ private:
     if (!param_client->has_parameter(DEV_STRING_PARAM_NAME)) {
       if (device_family_ == ublox_dgnss::DeviceFamily::X20P) {
         // X20P: Multiple USB interfaces available
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           this->get_logger(), "Parameter %s not found, will use first available %s USB interface.",
           DEV_STRING_PARAM_NAME.c_str(), info.name.c_str());
       } else {
         // F9P/F9R: Standard message
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
           this->get_logger(), "Parameter %s not found, will use first %s device.",
           DEV_STRING_PARAM_NAME.c_str(), info.name.c_str());
       }
@@ -724,12 +724,12 @@ private:
     // Get the parameter value
     serial_str_ = param_client->get_parameter<std::string>(DEV_STRING_PARAM_NAME);
     if (device_family_ == ublox_dgnss::DeviceFamily::X20P) {
-      RCLCPP_INFO(
+      RCLCPP_DEBUG(
         this->get_logger(),
         "Parameter %s found with value: %s (will connect to matching %s USB interface)",
         DEV_STRING_PARAM_NAME.c_str(), serial_str_.c_str(), info.name.c_str());
     } else {
-      RCLCPP_INFO(
+      RCLCPP_DEBUG(
         this->get_logger(), "Parameter %s found with value: %s",
         DEV_STRING_PARAM_NAME.c_str(), serial_str_.c_str());
     }
@@ -742,7 +742,7 @@ private:
     frame_id_ = "ubx";
     // Check if the parameter exists
     if (!param_client->has_parameter(FRAME_ID_PARAM_NAME)) {
-      RCLCPP_INFO(
+      RCLCPP_DEBUG(
         this->get_logger(), "Parameter %s not found, defaulting to 'ubx' frame_id",
         FRAME_ID_PARAM_NAME.c_str());
       return;
@@ -750,7 +750,7 @@ private:
 
     // Get the parameter value
     frame_id_ = param_client->get_parameter<std::string>(FRAME_ID_PARAM_NAME);
-    RCLCPP_INFO(
+    RCLCPP_DEBUG(
       this->get_logger(), "Parameter %s found with value: %s",
       FRAME_ID_PARAM_NAME.c_str(), frame_id_.c_str());
   }
@@ -765,7 +765,7 @@ private:
 
     // Check if the parameter exists
     if (!param_client->has_parameter(DEVICE_FAMILY_PARAM_NAME)) {
-      RCLCPP_INFO(
+      RCLCPP_DEBUG(
         this->get_logger(), "Parameter %s not found, defaulting to 'F9P' device family",
         DEVICE_FAMILY_PARAM_NAME.c_str());
       return;
@@ -1159,7 +1159,7 @@ public:
             }
           }
 
-          RCLCPP_INFO(
+          RCLCPP_DEBUG(
             get_logger(), "parameter set %s: %s",
             name.c_str(), parameter.value_to_string().c_str());
         } else {
@@ -1458,7 +1458,7 @@ public:
             buf[i] = 0;
           }
         }
-        RCLCPP_INFO(get_logger(), "nmea: %s", buf);
+        RCLCPP_DEBUG(get_logger(), "nmea: %s", buf);
       } else {
         // UBX starts with 0x65 0x62
         if (len > 2 && buf[0] == ubx::UBX_SYNC_CHAR_1 && buf[1] == ubx::UBX_SYNC_CHAR_2) {
@@ -1698,7 +1698,7 @@ public:
         ubx_cfg_->cfg_val_set_poll_async();
       }
 
-      RCLCPP_INFO(
+      RCLCPP_DEBUG(
         get_logger(), "Successfully sent %lu parameters to device via CFG-VALSET batch",
         i);
 
@@ -2677,7 +2677,7 @@ private:
           } else {
             declare_parameter("unique_id", unique_id_);
           }
-          RCLCPP_INFO(
+          RCLCPP_DEBUG(
             get_logger(), "ubx sec unique_id: 0x%s",
             unique_id_.c_str());
           // ubx_sec_uniqid_pub(f, ubx_sec_->uniqid()->payload());
@@ -3745,11 +3745,11 @@ private:
     }
 
     // Send ALL user parameters to device FIRST (highest priority)
-    RCLCPP_INFO(get_logger(), "Sending user parameters to device");
+    RCLCPP_DEBUG(get_logger(), "Sending user parameters to device");
     ublox_send_user_params_async();
 
     // Fetch all PARAM_INITIAL values from device
-    RCLCPP_INFO(get_logger(), "Fetching configuration parameter values from device");
+    RCLCPP_DEBUG(get_logger(), "Fetching configuration parameter values from device");
     ublox_fetch_device_params_async();
 
     RCLCPP_DEBUG(get_logger(), "finished ublox_init_all_cfg_items_async");
@@ -3814,7 +3814,7 @@ private:
       ubx_cfg_->cfg_val_set_cfgdata_clear();
     }
 
-    RCLCPP_INFO(get_logger(), "Sent %zu user parameters to device", user_params_sent);
+    RCLCPP_DEBUG(get_logger(), "Sent %zu user parameters to device", user_params_sent);
   }
 
   UBLOX_DGNSS_NODE_LOCAL
@@ -3867,7 +3867,7 @@ private:
           // every n keys send a request
           if (initial_params % n == 0) {
             if (ubx_cfg_->cfg_val_get_keys_size() > 0) {
-              RCLCPP_INFO(
+              RCLCPP_DEBUG(
                 get_logger(), "cfg_val_get_poll_async_all_layers ... %s",
                 item_list.c_str());
               item_list = "";
@@ -3880,12 +3880,12 @@ private:
 
     // send the final requests
     if (ubx_cfg_->cfg_val_get_keys_size() > 0) {
-      RCLCPP_INFO(get_logger(), "cfg_val_get_poll_async_all_layers ... %s", item_list.c_str());
+      RCLCPP_DEBUG(get_logger(), "cfg_val_get_poll_async_all_layers ... %s", item_list.c_str());
       ubx_cfg_->cfg_val_get_poll_async_all_layers();
       ubx_cfg_->cfg_val_get_keys_clear();
     }
 
-    RCLCPP_INFO(
+    RCLCPP_DEBUG(
       get_logger(), "Requested %zu device parameter values via CFG-VALGET",
       initial_params);
   }
@@ -4174,7 +4174,7 @@ private:
   UBLOX_DGNSS_NODE_LOCAL
   void ublox_dgnss_init_async()
   {
-    RCLCPP_INFO(get_logger(), "ublox_dgnss_init_async start");
+    RCLCPP_DEBUG(get_logger(), "ublox_dgnss_init_async start");
     RCLCPP_DEBUG(get_logger(), "ubx_mon_ver poll_async ...");
     ubx_mon_->ver()->poll_async();
     RCLCPP_DEBUG(get_logger(), "ubx_sec_uniqid poll_async ...");
@@ -4232,7 +4232,7 @@ private:
     // RCLCPP_INFO(get_logger(), "ubx_nav_velned poll_async ...");
     // ubx_nav_->velned()->poll_async();
 
-    RCLCPP_INFO(get_logger(), "ublox_dgnss_init_async finished");
+    RCLCPP_DEBUG(get_logger(), "ublox_dgnss_init_async finished");
   }
 };
 }  // namespace ublox_dgnss
