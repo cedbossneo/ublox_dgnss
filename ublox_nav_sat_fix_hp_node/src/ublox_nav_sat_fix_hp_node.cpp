@@ -185,7 +185,7 @@ private:
           ublox_ubx_msgs::msg::CarrSoln::CARRIER_SOLUTION_PHASE_WITH_FIXED_AMBIGUITIES)
         {
           nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
-        } else if (true == ubx_sta_msg->diff_soln) {  // diff corrections were applied
+        } else if (ubx_sta_msg->diff_soln) {  // diff corrections were applied
           nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
         } else {
           nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
