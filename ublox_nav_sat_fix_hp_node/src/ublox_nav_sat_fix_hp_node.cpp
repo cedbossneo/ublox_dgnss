@@ -181,7 +181,11 @@ private:
       case ublox_ubx_msgs::msg::GpsFix::GPS_FIX_2D:
       case ublox_ubx_msgs::msg::GpsFix::GPS_FIX_3D:
       case ublox_ubx_msgs::msg::GpsFix::GPS_PLUS_DEAD_RECKONING:
-        if (true == ubx_sta_msg->diff_soln) {  // diff corrections were applied
+        if (ubx_sta_msg->carr_soln.status ==
+          ublox_ubx_msgs::msg::CarrSoln::CARRIER_SOLUTION_PHASE_WITH_FIXED_AMBIGUITIES)
+        {
+          nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
+        } else if (ubx_sta_msg->diff_soln) {  // diff corrections were applied
           nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
         } else {
           nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
