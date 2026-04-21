@@ -56,6 +56,15 @@ public:
     declare_parameter("password", "password");
     declare_parameter("log_level", "INFO");
     declare_parameter("maxage_conn", 30);
+    // Number of RTCM records received between forced unwinds of the curl
+    // streaming call. Each unwind lets DoStreaming check streaming_exit_
+    // for clean shutdown, but also triggers a full HTTP reconnect (TCP
+    // handshake + GET). At high RTCM rates the default 10 caused a
+    // reconnect every ~0.6 s, which denied the F9P the continuous stream
+    // it needs to re-fix integer ambiguities after a sky obstruction.
+    // 10000 keeps reconnects well outside the ambiguity-resolution window
+    // while still bounding shutdown latency.
+    declare_parameter("stream_exit_check_records", 10000);
 
     use_https_ = get_parameter("use_https").as_bool();
     host_ = get_parameter("host").as_string();
@@ -95,10 +104,20 @@ public:
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    // Set the desired record count - libcurl will keep reading from the ntrip castor indefinitly
-    // this is used to force it to exit in WriteCallback. In DoStreaming it will check to see if
-    // streaing_exit_ is true, such that the ros2 node can terminate cleanly
-    int desiredCount = 10;
+    // Exit-check cadence: libcurl would read from the NTRIP caster
+    // indefinitely; to let DoStreaming observe streaming_exit_ we force
+    // WriteCallback to unwind curl_easy_perform every N records. The
+    // value is configurable via the `stream_exit_check_records` ROS
+    // parameter — see its declare_parameter() comment above for why the
+    // upstream default of 10 was far too aggressive for F9P RTK.
+    int desiredCount = get_parameter("stream_exit_check_records").as_int();
+    if (desiredCount < 1) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "stream_exit_check_records=%d is invalid; clamping to 1",
+        desiredCount);
+      desiredCount = 1;
+    }
 
     auto handle = curlHandle_->handle;
     if (handle) {
