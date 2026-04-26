@@ -172,11 +172,10 @@ void Connection::serial_read_loop()
 void Connection::init()
 {
   if (transport_ == Transport::SERIAL) {
-    if (serial_fd_ >= 0) {
-      // Idempotent: already opened — just notify attach for hotplug-style flow
-      if (hp_attach_cb_fn_) {(hp_attach_cb_fn_)();}
-      return;
-    }
+    // Idempotent: hp_attach_cb_fn_ in the node calls perform_usb_initialization,
+    // which calls back into init() → we'd recurse infinitely if we re-fired
+    // the attach callback every time. Only fire it on the FIRST init.
+    if (serial_fd_ >= 0) {return;}
     if (debug_cb_fn_) {
       (debug_cb_fn_)("init(): SERIAL mode — opening " + serial_path_);
     }
