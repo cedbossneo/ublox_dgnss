@@ -184,6 +184,13 @@ public:
       if (strcmp(name.c_str(), DEVICE_FAMILY_PARAM_NAME.c_str()) == 0) {
         continue;
       }
+      // Transport selection params (handled separately, not pushed to F9P)
+      if (strcmp(name.c_str(), "TRANSPORT") == 0) {
+        continue;
+      }
+      if (strcmp(name.c_str(), "DEVICE_PATH") == 0) {
+        continue;
+      }
       // ignore other parameters that don't start with "CFG"
       if (strncmp(name.c_str(), "CFG", 3) != 0) {
         continue;
@@ -314,15 +321,46 @@ public:
     usb::connection_debug_cb_fn connection_debug_callback = std::bind(
       &UbloxDGNSSNode::usb_debug_callback, this, _1);
 
-    // Device family-aware USB connection creation
+    // Transport selection — defaults to USB (libusb) for backwards compat.
+    // Set TRANSPORT=serial in the params yaml to use the kernel CDC ACM
+    // driver via DEVICE_PATH (e.g. /dev/ttyACM1). The serial path bypasses
+    // libusb's URB pipeline that introduces ~3.5 s of latency between the
+    // F9P measurement instant and the host-side header.stamp.
+    std::string transport_str = "usb";
+    rclcpp::Parameter p_transport;
+    if (this->get_parameter("TRANSPORT", p_transport)) {
+      try {
+        transport_str = p_transport.as_string();
+      } catch (...) {
+        // wrong type, ignore
+      }
+    }
+    RCLCPP_INFO(get_logger(), "TRANSPORT param resolved to: '%s'", transport_str.c_str());
+    std::transform(
+      transport_str.begin(), transport_str.end(),
+      transport_str.begin(), ::tolower);
+
     auto device_info = ublox_dgnss::get_device_family_info(device_family_);
-    RCLCPP_DEBUG(
-      get_logger(), "Make USB Connection - Device: %s, Product IDs: %zu, Serial: '%s'",
-      device_info.description.c_str(), device_info.product_ids.size(),
-      serial_str_.c_str());
-    usbc_ = std::make_shared<usb::Connection>(
-      U_BLOX_AG_VENDOR_ID, device_info.product_ids,
-      serial_str_, device_family_);
+
+    if (transport_str == "serial") {
+      std::string device_path = "/dev/ttyACM1";
+      if (this->has_parameter("DEVICE_PATH")) {
+        device_path = this->get_parameter("DEVICE_PATH").as_string();
+      }
+      RCLCPP_INFO(
+        get_logger(), "Make Connection (SERIAL) — device_path=%s",
+        device_path.c_str());
+      usbc_ = std::make_shared<usb::Connection>(
+        usb::Transport::SERIAL, device_path, 9600, device_family_);
+    } else {
+      RCLCPP_DEBUG(
+        get_logger(), "Make USB Connection - Device: %s, Product IDs: %zu, Serial: '%s'",
+        device_info.description.c_str(), device_info.product_ids.size(),
+        serial_str_.c_str());
+      usbc_ = std::make_shared<usb::Connection>(
+        U_BLOX_AG_VENDOR_ID, device_info.product_ids,
+        serial_str_, device_family_);
+    }
 
     RCLCPP_DEBUG(get_logger(), "setting up usb callbacks ...");
     usbc_->set_in_callback(connection_in_callback);

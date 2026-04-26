@@ -53,6 +53,11 @@ namespace usb
 using UCharVector = std::vector<u_char>;
 enum TransferType {USB_IN, USB_OUT};
 
+// Transport backend for the GNSS receiver. SERIAL bypasses libusb entirely
+// and uses the kernel CDC ACM driver (e.g. /dev/ttyACM1) — fixes the ~3.5 s
+// pipeline lag observed on aussierobots/ublox_dgnss running over libusb.
+enum class Transport { USB, SERIAL };
+
 enum class USBDriverState
 {
   DISCONNECTED,           // No USB device
@@ -155,6 +160,16 @@ private:
   int no_device_streak_ = 0;
   static constexpr int kNoDeviceThreshold = 3;
 
+  // SERIAL backend
+  Transport transport_ = Transport::USB;
+  std::string serial_path_;
+  int serial_baud_ = 9600;          // CDC ACM, baud is virtual but pyserial defaults to 9600
+  int serial_fd_ = -1;
+  std::atomic<bool> serial_thread_running_{false};
+  std::thread serial_read_thread_;
+  void serial_read_loop();           // body of the serial read thread
+  bool open_serial();                // opens serial_fd_, configures termios raw
+
 private:
   libusb_device_handle * open_device_with_serial_string(
     libusb_context * ctx, int vendor_id,
@@ -190,7 +205,16 @@ public:
     int vendor_id, const std::vector<uint16_t> & product_ids, std::string serial_str,
     ublox_dgnss::DeviceFamily device_family = ublox_dgnss::DeviceFamily::F9P,
     int log_level = LIBUSB_OPTION_LOG_LEVEL);
+  // SERIAL constructor — opens a CDC ACM device path instead of claiming the
+  // F9P over libusb. All subsequent reads/writes use the kernel CDC driver,
+  // which delivers UBX packets within ~140 ms of measurement instead of the
+  // ~3.5 s libusb URB pipeline lag.
+  Connection(
+    Transport transport, std::string device_path, int baud = 9600,
+    ublox_dgnss::DeviceFamily device_family = ublox_dgnss::DeviceFamily::F9P,
+    int log_level = LIBUSB_OPTION_LOG_LEVEL);
   ~Connection();
+  Transport transport() const {return transport_;}
   void set_in_callback(connection_in_cb_fn in_cb_fn)
   {
     in_cb_fn_ = in_cb_fn;
@@ -233,10 +257,12 @@ public:
   }
   bool inline dev_valid()
   {
+    if (transport_ == Transport::SERIAL) {return serial_fd_ >= 0;}
     return dev_ != nullptr;
   }
   bool inline devh_valid()
   {
+    if (transport_ == Transport::SERIAL) {return serial_fd_ >= 0;}
     return devh_ != nullptr;
   }
   int bus_number()

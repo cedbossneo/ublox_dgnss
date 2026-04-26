@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <errno.h>
 #include <functional>
 #include <chrono>
 #include <thread>
@@ -62,8 +67,132 @@ Connection::Connection(
     callback);
 }
 
+// SERIAL backend constructor: skips all libusb setup. The same Connection
+// class is reused (single internal switch via transport_) so the rest of
+// the driver's public API (write_buffer, set_in_callback, etc.) is
+// transport-agnostic.
+Connection::Connection(
+  Transport transport, std::string device_path, int baud,
+  ublox_dgnss::DeviceFamily device_family, int log_level)
+{
+  transport_ = transport;
+  serial_path_ = device_path;
+  serial_baud_ = baud;
+  device_family_ = device_family;
+  vendor_id_ = 0;
+  connected_product_id_ = 0;
+  log_level_ = log_level;
+  ctx_ = nullptr;
+  devh_ = nullptr;
+  dev_ = nullptr;
+  timeout_ms_ = 250;
+  timeout_tv_ = {0, 0};
+  keep_running_ = true;
+  attached_ = false;
+  driver_state_ = USBDriverState::DISCONNECTED;
+  // No libusb callback wiring needed in serial mode; in/out callbacks are
+  // fired directly from serial_read_loop / write_buffer.
+}
+
+bool Connection::open_serial()
+{
+  serial_fd_ = ::open(serial_path_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+  if (serial_fd_ < 0) {
+    return false;
+  }
+  struct termios tio;
+  if (tcgetattr(serial_fd_, &tio) != 0) {
+    ::close(serial_fd_);
+    serial_fd_ = -1;
+    return false;
+  }
+  cfmakeraw(&tio);
+  cfsetispeed(&tio, B9600);  // CDC ACM is virtual — speed doesn't matter
+  cfsetospeed(&tio, B9600);
+  tio.c_cflag |= (CLOCAL | CREAD);
+  tio.c_cflag &= ~CRTSCTS;
+  tio.c_iflag &= ~(IXON | IXOFF | IXANY);
+  // Block-on-read with a small timeout so the read thread checks
+  // keep_running_ flag often.
+  tio.c_cc[VMIN] = 0;
+  tio.c_cc[VTIME] = 1;  // 100 ms tenths
+  tcsetattr(serial_fd_, TCSANOW, &tio);
+  // Switch back to blocking mode now that termios is set
+  int flags = fcntl(serial_fd_, F_GETFL, 0);
+  fcntl(serial_fd_, F_SETFL, flags & ~O_NONBLOCK);
+  tcflush(serial_fd_, TCIOFLUSH);
+  return true;
+}
+
+void Connection::serial_read_loop()
+{
+  // Allocate a single libusb_transfer struct and reuse it for every chunk.
+  // The driver's ublox_in_callback only reads `actual_length` and `buffer`,
+  // so we just keep those two fields valid. This is purely a shape adapter
+  // — no actual USB resources are involved.
+  std::vector<unsigned char> read_buf(4096);
+  libusb_transfer * fake_transfer = libusb_alloc_transfer(0);
+  if (!fake_transfer) {
+    if (debug_cb_fn_) {(debug_cb_fn_)("serial_read_loop: alloc_transfer failed");}
+    return;
+  }
+  fake_transfer->buffer = read_buf.data();
+  fake_transfer->length = read_buf.size();
+  fake_transfer->status = LIBUSB_TRANSFER_COMPLETED;
+
+  while (serial_thread_running_.load() && keep_running_) {
+    ssize_t n = ::read(serial_fd_, read_buf.data(), read_buf.size());
+    if (n > 0) {
+      fake_transfer->actual_length = static_cast<int>(n);
+      if (in_cb_fn_) {
+        try {
+          (in_cb_fn_)(fake_transfer);
+        } catch (const std::exception & e) {
+          if (debug_cb_fn_) {(debug_cb_fn_)(std::string("serial in_cb_fn_: ") + e.what());}
+        }
+      }
+    } else if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+        continue;
+      }
+      if (debug_cb_fn_) {
+        (debug_cb_fn_)(std::string("serial read errno=") + std::to_string(errno));
+      }
+      // Try to reopen
+      ::close(serial_fd_);
+      serial_fd_ = -1;
+      while (serial_thread_running_.load() && keep_running_) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (open_serial()) {break;}
+      }
+    }
+    // n == 0 → timeout, just loop
+  }
+
+  libusb_free_transfer(fake_transfer);
+}
+
 void Connection::init()
 {
+  if (transport_ == Transport::SERIAL) {
+    if (serial_fd_ >= 0) {
+      // Idempotent: already opened — just notify attach for hotplug-style flow
+      if (hp_attach_cb_fn_) {(hp_attach_cb_fn_)();}
+      return;
+    }
+    if (debug_cb_fn_) {
+      (debug_cb_fn_)("init(): SERIAL mode — opening " + serial_path_);
+    }
+    driver_state_ = USBDriverState::CONNECTING;
+    if (!open_serial()) {
+      throw std::string("Failed to open serial device: ") + serial_path_;
+    }
+    attached_ = true;
+    driver_state_ = USBDriverState::CONNECTED;
+    if (hp_attach_cb_fn_) {(hp_attach_cb_fn_)();}
+    return;
+  }
+
   // Check if already initialized
   if (ctx_ != nullptr) {
     if (debug_cb_fn_) {
@@ -550,6 +679,24 @@ void Connection::write_char(u_char c)
 
 void Connection::write_buffer(u_char * buf, size_t size)
 {
+  if (transport_ == Transport::SERIAL) {
+    if (serial_fd_ < 0) {
+      throw UsbException("write_buffer: serial fd not open");
+    }
+    const std::lock_guard<std::mutex> lock(write_mutex_);
+    size_t total = 0;
+    while (total < size) {
+      ssize_t n = ::write(serial_fd_, buf + total, size - total);
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EINTR) {continue;}
+        throw UsbException(std::string("serial write errno=") + std::to_string(errno));
+      }
+      if (n == 0) {break;}
+      total += n;
+    }
+    return;
+  }
+
   if (debug_cb_fn_) {
     std::ostringstream oss;
     oss << "write_buffer: sending " << size << " bytes to endpoint 0x"
@@ -717,6 +864,12 @@ void Connection::callback_in(struct libusb_transfer * transfer)
 void Connection::write_buffer_async(u_char * buf, size_t size, void * user_data)
 {
   (void)user_data;
+  if (transport_ == Transport::SERIAL) {
+    // No async write needed for serial — kernel handles its own buffering.
+    write_buffer(buf, size);
+    return;
+  }
+
   if (out_cb_fn_ == nullptr) {
     throw UsbException("No out callback function set");
   }
@@ -909,6 +1062,18 @@ size_t Connection::queued_transfer_in_num()
 
 void Connection::init_async()
 {
+  if (transport_ == Transport::SERIAL) {
+    if (in_cb_fn_ == nullptr) {throw UsbException("No in callback function set");}
+    if (serial_thread_running_.load()) {
+      // Already running — idempotent for reconnect-style calls.
+      return;
+    }
+    if (debug_cb_fn_) {(debug_cb_fn_)("init_async: SERIAL mode — starting read thread");}
+    serial_thread_running_.store(true);
+    serial_read_thread_ = std::thread(&Connection::serial_read_loop, this);
+    return;
+  }
+
   if (devh_ == nullptr) {
     throw UsbException("No device handle set");
   }
@@ -938,6 +1103,12 @@ void Connection::init_async()
 
 void Connection::handle_usb_events()
 {
+  if (transport_ == Transport::SERIAL) {
+    // No-op in serial mode — reads are driven by serial_read_loop on its
+    // own thread; nothing for this periodic timer to do.
+    return;
+  }
+
   if (!keep_running_) {return;}
 
   // don’t call into libusb until init() has succeeded
@@ -990,6 +1161,20 @@ void Connection::shutdown()
 {
   keep_running_ = false;
 
+  if (transport_ == Transport::SERIAL) {
+    serial_thread_running_.store(false);
+    if (serial_read_thread_.joinable()) {
+      serial_read_thread_.join();
+    }
+    if (serial_fd_ >= 0) {
+      ::close(serial_fd_);
+      serial_fd_ = -1;
+    }
+    attached_ = false;
+    driver_state_ = USBDriverState::DISCONNECTED;
+    return;
+  }
+
   // de register hotplug callbacks
   for (auto handle : hp_attach_) {
     if (handle) {
@@ -1009,6 +1194,8 @@ Connection::~Connection()
 {
   shutdown();
 
-  libusb_exit(ctx_);
+  if (transport_ != Transport::SERIAL && ctx_ != nullptr) {
+    libusb_exit(ctx_);
+  }
 }
 }  // namespace usb
