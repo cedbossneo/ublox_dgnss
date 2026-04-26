@@ -267,22 +267,30 @@ public:
     if (transport_ == Transport::SERIAL) {return serial_fd_ >= 0;}
     return devh_ != nullptr;
   }
+  // libusb-specific accessors: SERIAL mode has no libusb device handle, so
+  // these must short-circuit BEFORE dereferencing dev_ (which is nullptr).
+  // Previously they only gated on dev_valid(), which I changed to return
+  // true in SERIAL — that turned every diagnostic logger into a NULL deref.
   int bus_number()
   {
-    return dev_valid() ? libusb_get_bus_number(dev_) : 0;
+    if (transport_ == Transport::SERIAL || dev_ == nullptr) {return 0;}
+    return libusb_get_bus_number(dev_);
   }
   int device_address()
   {
-    return dev_valid() ? libusb_get_device_address(dev_) : 0;
+    if (transport_ == Transport::SERIAL || dev_ == nullptr) {return 0;}
+    return libusb_get_device_address(dev_);
   }
   int device_speed()
   {
-    return dev_valid() ? libusb_get_device_speed(dev_) : 0;
+    if (transport_ == Transport::SERIAL || dev_ == nullptr) {return 0;}
+    return libusb_get_device_speed(dev_);
   }
   char * device_speed_txt();
   u_int8_t port_number()
   {
-    return dev_valid() ? libusb_get_port_number(dev_) : 0;
+    if (transport_ == Transport::SERIAL || dev_ == nullptr) {return 0;}
+    return libusb_get_port_number(dev_);
   }
   int read_chars(u_char * data, size_t size);
   void write_char(u_char c);
