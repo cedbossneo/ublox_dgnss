@@ -131,22 +131,21 @@ void Connection::serial_read_loop()
   // so we just keep those two fields valid. This is purely a shape adapter
   // — no actual USB resources are involved.
   std::vector<unsigned char> read_buf(4096);
-  libusb_transfer * fake_transfer = libusb_alloc_transfer(0);
-  if (!fake_transfer) {
-    if (debug_cb_fn_) {(debug_cb_fn_)("serial_read_loop: alloc_transfer failed");}
-    return;
-  }
-  fake_transfer->buffer = read_buf.data();
-  fake_transfer->length = read_buf.size();
-  fake_transfer->status = LIBUSB_TRANSFER_COMPLETED;
+  // We never call libusb_init() in SERIAL mode, so libusb_alloc_transfer()
+  // is not safe to call. Zero-init a libusb_transfer on the stack — the in
+  // callback only reads {buffer, actual_length, status}.
+  libusb_transfer fake_transfer{};
+  fake_transfer.buffer = read_buf.data();
+  fake_transfer.length = read_buf.size();
+  fake_transfer.status = LIBUSB_TRANSFER_COMPLETED;
 
   while (serial_thread_running_.load() && keep_running_) {
     ssize_t n = ::read(serial_fd_, read_buf.data(), read_buf.size());
     if (n > 0) {
-      fake_transfer->actual_length = static_cast<int>(n);
+      fake_transfer.actual_length = static_cast<int>(n);
       if (in_cb_fn_) {
         try {
-          (in_cb_fn_)(fake_transfer);
+          (in_cb_fn_)(&fake_transfer);
         } catch (const std::exception & e) {
           if (debug_cb_fn_) {(debug_cb_fn_)(std::string("serial in_cb_fn_: ") + e.what());}
         }
@@ -168,8 +167,6 @@ void Connection::serial_read_loop()
     }
     // n == 0 → timeout, just loop
   }
-
-  libusb_free_transfer(fake_transfer);
 }
 
 void Connection::init()
