@@ -130,25 +130,84 @@ void Connection::serial_read_loop()
   // The driver's ublox_in_callback only reads `actual_length` and `buffer`,
   // so we just keep those two fields valid. This is purely a shape adapter
   // — no actual USB resources are involved.
-  std::vector<unsigned char> read_buf(4096);
-  // We never call libusb_init() in SERIAL mode, so libusb_alloc_transfer()
-  // is not safe to call. Zero-init a libusb_transfer on the stack — the in
-  // callback only reads {buffer, actual_length, status}.
+  // ublox_in_callback assumes ONE protocol frame (UBX, NMEA or RTCM3) per
+  // call — it only inspects buf[0..1] to dispatch. In libusb mode, each
+  // URB completes on a short packet so this naturally aligns with one
+  // frame per callback. On serial we get a stream of bytes that may pack
+  // multiple frames per ::read(), so we frame here and fire the callback
+  // once per complete frame.
+  std::vector<unsigned char> chunk_buf(4096);
+  std::vector<unsigned char> stream;        // pending bytes
+  stream.reserve(8192);
   libusb_transfer fake_transfer{};
-  fake_transfer.buffer = read_buf.data();
-  fake_transfer.length = read_buf.size();
   fake_transfer.status = LIBUSB_TRANSFER_COMPLETED;
 
+  auto fire = [&](const unsigned char * data, size_t len) {
+    if (!in_cb_fn_) {return;}
+    fake_transfer.buffer = const_cast<unsigned char *>(data);
+    fake_transfer.length = static_cast<int>(len);
+    fake_transfer.actual_length = static_cast<int>(len);
+    try {
+      (in_cb_fn_)(&fake_transfer);
+    } catch (const std::exception & e) {
+      if (debug_cb_fn_) {(debug_cb_fn_)(std::string("serial in_cb_fn_: ") + e.what());}
+    }
+  };
+
   while (serial_thread_running_.load() && keep_running_) {
-    ssize_t n = ::read(serial_fd_, read_buf.data(), read_buf.size());
+    ssize_t n = ::read(serial_fd_, chunk_buf.data(), chunk_buf.size());
     if (n > 0) {
-      fake_transfer.actual_length = static_cast<int>(n);
-      if (in_cb_fn_) {
-        try {
-          (in_cb_fn_)(&fake_transfer);
-        } catch (const std::exception & e) {
-          if (debug_cb_fn_) {(debug_cb_fn_)(std::string("serial in_cb_fn_: ") + e.what());}
+      stream.insert(stream.end(), chunk_buf.begin(), chunk_buf.begin() + n);
+
+      size_t pos = 0;
+      while (pos < stream.size()) {
+        unsigned char b0 = stream[pos];
+
+        // UBX frame: 0xb5 0x62 cls id len_lo len_hi payload[len] ck_a ck_b
+        if (b0 == 0xb5 && pos + 1 < stream.size() && stream[pos + 1] == 0x62) {
+          if (pos + 6 > stream.size()) {break;}  // need header
+          uint16_t plen = static_cast<uint16_t>(stream[pos + 4]) |
+            (static_cast<uint16_t>(stream[pos + 5]) << 8);
+          size_t total = 6 + plen + 2;
+          if (pos + total > stream.size()) {break;}  // need full frame
+          fire(&stream[pos], total);
+          pos += total;
+          continue;
         }
+
+        // NMEA frame: $...<CR><LF>
+        if (b0 == '$') {
+          size_t end = pos;
+          while (end < stream.size() && stream[end] != '\n') {end++;}
+          if (end >= stream.size()) {break;}  // need more bytes
+          size_t total = end - pos + 1;
+          fire(&stream[pos], total);
+          pos += total;
+          continue;
+        }
+
+        // RTCM3 frame: 0xD3 0x00 plen_hi plen_lo payload[plen] crc[3]
+        if (b0 == 0xD3 && pos + 1 < stream.size() && (stream[pos + 1] & 0xFC) == 0x00) {
+          if (pos + 3 > stream.size()) {break;}
+          uint16_t plen = (static_cast<uint16_t>(stream[pos + 1] & 0x03) << 8) | stream[pos + 2];
+          size_t total = 3 + plen + 3;
+          if (pos + total > stream.size()) {break;}
+          fire(&stream[pos], total);
+          pos += total;
+          continue;
+        }
+
+        // Unknown byte — drop and resync
+        pos++;
+      }
+
+      // Drop consumed bytes from the front of the stream
+      if (pos > 0) {
+        stream.erase(stream.begin(), stream.begin() + pos);
+      }
+      // Cap stream to avoid unbounded growth on persistent garbage
+      if (stream.size() > 65536) {
+        stream.erase(stream.begin(), stream.end() - 8192);
       }
     } else if (n < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
