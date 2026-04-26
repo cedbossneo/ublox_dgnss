@@ -24,8 +24,10 @@
 #include <exception>
 #include <string>
 #include <functional>
+#include <atomic>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <memory>
 
