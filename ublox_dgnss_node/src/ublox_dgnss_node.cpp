@@ -1440,7 +1440,13 @@ public:
     try {
       usbc_->write_buffer(data_out.data(), data_out.size());
     } catch (const usb::UsbException & e) {
-      RCLCPP_WARN(get_logger(), "RTCM write failed: %s", e.what());
+      // Throttle: when the device hot-disconnects, serial_reopen_blocking()
+      // in usb.cpp recovers the FD on its own. While it retries, every
+      // incoming RTCM frame (~17 Hz) would otherwise emit a WARN — this
+      // used to fill `docker logs` so fast that the rotation buffer wrapped
+      // and the original disconnect cause was lost.
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000, "RTCM write failed: %s", e.what());
     }
   }
 
