@@ -94,6 +94,33 @@ Connection::Connection(
   // fired directly from serial_read_loop / write_buffer.
 }
 
+void Connection::serial_reopen_blocking()
+{
+  // Performs close+reopen of the CDC ACM device under write_mutex_ so an
+  // in-flight write_buffer() doesn't race on serial_fd_. open_serial()
+  // resolves serial_path_ on each call, which means a by-id symlink
+  // updated by udev after re-enumeration (typical: ttyACM1 → ttyACM2 on
+  // a brief USB disconnect) is picked up automatically.
+  const std::lock_guard<std::mutex> lock(write_mutex_);
+  if (serial_fd_ >= 0) {
+    ::close(serial_fd_);
+    serial_fd_ = -1;
+  }
+  // Loop until reopen succeeds or shutdown is requested. 1 s backoff is
+  // intentional — the kernel typically takes 1-2 s to re-enumerate a
+  // hot-replugged CDC ACM device.
+  while (serial_thread_running_.load() && keep_running_) {
+    if (open_serial()) {
+      serial_needs_reopen_.store(false);
+      if (debug_cb_fn_) {
+        (debug_cb_fn_)("serial_reopen: reopened " + serial_path_);
+      }
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+}
+
 bool Connection::open_serial()
 {
   serial_fd_ = ::open(serial_path_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -155,6 +182,13 @@ void Connection::serial_read_loop()
   };
 
   while (serial_thread_running_.load() && keep_running_) {
+    // Writer side noticed the CDC ACM device disappeared (EIO/ENODEV/…) —
+    // recover before the next read so we don't sit forever on an orphan FD.
+    if (serial_needs_reopen_.load() || serial_fd_ < 0) {
+      serial_reopen_blocking();
+      if (!serial_thread_running_.load() || !keep_running_) {break;}
+      continue;
+    }
     ssize_t n = ::read(serial_fd_, chunk_buf.data(), chunk_buf.size());
     if (n > 0) {
       stream.insert(stream.end(), chunk_buf.begin(), chunk_buf.begin() + n);
@@ -216,15 +250,15 @@ void Connection::serial_read_loop()
       if (debug_cb_fn_) {
         (debug_cb_fn_)(std::string("serial read errno=") + std::to_string(errno));
       }
-      // Try to reopen
-      ::close(serial_fd_);
-      serial_fd_ = -1;
-      while (serial_thread_running_.load() && keep_running_) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        if (open_serial()) {break;}
-      }
+      serial_needs_reopen_.store(true);
+      // Loop back to top — serial_reopen_blocking() runs there under
+      // write_mutex_ so the writer can't observe a closed FD mid-write.
     }
-    // n == 0 → timeout, just loop
+    // n == 0 → CDC ACM termios timeout (VTIME=1, 100 ms). On a healthy
+    // device this is the normal "no data this tick" return; we just loop.
+    // On disconnect some kernels keep returning 0 silently — that case is
+    // handled via the writer flagging serial_needs_reopen_, picked up at
+    // the top of the loop on the next iteration.
   }
 }
 
@@ -736,7 +770,11 @@ void Connection::write_buffer(u_char * buf, size_t size)
 {
   if (transport_ == Transport::SERIAL) {
     if (serial_fd_ < 0) {
-      throw UsbException("write_buffer: serial fd not open");
+      // Reader thread is mid-reopen or hasn't recovered yet. Surface this
+      // distinctly so the reader keeps owning recovery (any reopen attempt
+      // here would race the read loop on serial_fd_).
+      serial_needs_reopen_.store(true);
+      throw UsbException("write_buffer: serial fd not open (reopen pending)");
     }
     const std::lock_guard<std::mutex> lock(write_mutex_);
     size_t total = 0;
@@ -744,6 +782,17 @@ void Connection::write_buffer(u_char * buf, size_t size)
       ssize_t n = ::write(serial_fd_, buf + total, size - total);
       if (n < 0) {
         if (errno == EAGAIN || errno == EINTR) {continue;}
+        // EIO/ENODEV/ENXIO/EBADF/EPIPE all mean the underlying CDC ACM
+        // device went away (USB disconnect, kernel-side detach, etc.).
+        // The read thread's existing reopen path doesn't reliably trigger
+        // in this case (read() can sit silent or return EOF on the orphan
+        // FD), so flag it from here — the read loop picks it up at the
+        // top of its next iteration.
+        if (errno == EIO || errno == ENODEV || errno == ENXIO ||
+          errno == EBADF || errno == EPIPE)
+        {
+          serial_needs_reopen_.store(true);
+        }
         throw UsbException(std::string("serial write errno=") + std::to_string(errno));
       }
       if (n == 0) {break;}

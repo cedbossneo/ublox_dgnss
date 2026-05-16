@@ -168,9 +168,17 @@ private:
   int serial_baud_ = 9600;          // CDC ACM, baud is virtual but pyserial defaults to 9600
   int serial_fd_ = -1;
   std::atomic<bool> serial_thread_running_{false};
+  // Set by write_buffer() when the kernel reports the CDC ACM device has gone
+  // away (errno EIO/ENODEV/ENXIO/EBADF/EPIPE). The read loop watches this and
+  // performs a close+reopen of serial_path_ — which re-resolves the by-id
+  // symlink, so a re-enumerated device on a different minor (e.g. ttyACM1 →
+  // ttyACM2 after a brief USB disconnect) is picked up without restarting
+  // the node.
+  std::atomic<bool> serial_needs_reopen_{false};
   std::thread serial_read_thread_;
   void serial_read_loop();           // body of the serial read thread
   bool open_serial();                // opens serial_fd_, configures termios raw
+  void serial_reopen_blocking();     // close+open under write_mutex_, with backoff
 
 private:
   libusb_device_handle * open_device_with_serial_string(
