@@ -78,12 +78,27 @@ private:
   // routinely dropped by the receiver's internal USB tx buffer when bigger
   // messages (NAV-SAT, NAV-SIG, NMEA-GGA) co-occur — in practice we observed
   // NAV-STATUS arriving at ~3 Hz and NAV-COV at ~1 Hz when configured at 7 Hz.
-  // Each cached value is tagged with the iTOW of the epoch it came from so we
-  // only apply it to /fix when it matches the current HPPOSLLH epoch; older
-  // values are not republished blindly (which silently labelled Float epochs
-  // as Fixed and vice-versa).
+  //
+  // Each cached value is tagged with the iTOW of the epoch it came from.
+  // - STATUS is treated as fast-changing (carr_soln can flip on a single
+  //   cycle slip): require an exact iTOW match before reusing the cached
+  //   status, otherwise classify from per-epoch h_acc.
+  // - COV is treated as slow-changing: keep using the cached NED→ENU matrix
+  //   even when its iTOW is older than the current HPPOSLLH, as long as it's
+  //   recent enough (<= STALE_COV_THRESHOLD_S). Only fall back to an
+  //   h_acc-derived diagonal when NAV-COV is genuinely missing or stale.
+  //
+  // hAcc / vAcc from HPPOSLLH are ~95 % confidence estimates ≈ 2.45 × the
+  // 1-σ that NAV-COV reports for the same epoch. Empirically on an F9P
+  // with RTK-Fixed: NAV-COV σ ≈ 4-7 mm vs hAcc ≈ 14 mm. The fallback divides
+  // by HACC_TO_SIGMA so it produces a covariance compatible with NAV-COV
+  // rather than ~6× over-stated.
+  static constexpr double HACC_TO_SIGMA = 2.45;
+  static constexpr double STALE_COV_THRESHOLD_S = 5.0;
+
   std::array<double, POS_COV_ARR_SIZE> cached_enu_pos_cov_;
   uint32_t cached_cov_itow_ = 0;
+  rclcpp::Time cached_cov_stamp_;
   bool have_cached_cov_ = false;
 
   sensor_msgs::msg::NavSatStatus cached_nav_sat_stat_;
@@ -127,17 +142,19 @@ private:
 
     // Status. Prefer the receiver's own NAV-STATUS classification (which
     // distinguishes RTK Fixed / Float / DGPS / autonomous) when its iTOW
-    // matches this epoch. When NAV-STATUS was dropped, classify by h_acc as
-    // a robust fallback: RTK Fixed solutions report h_acc in the 3-15 mm
-    // range, Float / DGPS in tens of cm, autonomous in metres.
+    // matches this epoch — carr_soln can flip on a single cycle slip so a
+    // strict match is what protects against publishing a Float-position
+    // tagged with a stale Fixed status. When NAV-STATUS was dropped for
+    // this epoch, classify by h_acc as a fallback: RTK Fixed typically
+    // reports h_acc 3-30 mm, Float / DGPS 100 mm-2 m, autonomous 1-5 m+.
     if (have_cached_status_ && cached_status_itow_ == ubx_hppos_llh_msg->itow) {
       nav_sat_fix_msg.status = cached_nav_sat_stat_;
     } else {
       sensor_msgs::msg::NavSatStatus status;
       status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
-      if (h_acc_m < 0.020) {
+      if (h_acc_m < 0.050) {
         status.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
-      } else if (h_acc_m < 0.500) {
+      } else if (h_acc_m < 2.000) {
         status.status = sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
       } else {
         status.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
@@ -145,20 +162,33 @@ private:
       nav_sat_fix_msg.status = status;
     }
 
-    // Position covariance. Prefer the full NAV-COV NED-rotated 3x3 when its
-    // iTOW matches this epoch; otherwise synthesise a diagonal from h_acc /
-    // v_acc. This keeps the covariance attached to /fix self-consistent with
-    // the position even when the receiver drops NAV-COV (which happens for
-    // ~80 % of epochs on a ZED-F9P at 7 Hz with NAV-SAT/NAV-SIG enabled).
-    if (have_cached_cov_ && cached_cov_itow_ == ubx_hppos_llh_msg->itow) {
+    // Position covariance. NAV-COV is slow-changing (relative to the per-epoch
+    // position): reuse the last cached NED→ENU matrix as long as it's recent
+    // (within STALE_COV_THRESHOLD_S). Only synthesise an h_acc-based diagonal
+    // when NAV-COV has never been received or is genuinely stale — this
+    // avoids /fix.position_covariance flickering between the receiver's tight
+    // NAV-COV (σ ≈ 5 mm) and a conservative h_acc fallback every time
+    // NAV-COV drops a message.
+    bool cov_is_fresh = false;
+    if (have_cached_cov_) {
+      double age_s = (ubx_hppos_llh_msg->header.stamp.sec +
+        ubx_hppos_llh_msg->header.stamp.nanosec * 1e-9) -
+        (cached_cov_stamp_.seconds());
+      cov_is_fresh = age_s < STALE_COV_THRESHOLD_S;
+    }
+    if (cov_is_fresh) {
       for (size_t i = 0; i < cached_enu_pos_cov_.size(); i++) {
         nav_sat_fix_msg.position_covariance[i] = cached_enu_pos_cov_[i];
       }
       nav_sat_fix_msg.position_covariance_type =
         sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_KNOWN;
     } else {
-      double sigma_h_sq = h_acc_m * h_acc_m;
-      double sigma_v_sq = v_acc_m * v_acc_m;
+      // hAcc / vAcc are ~95 % confidence radii on F9P, so divide by ~2.45
+      // to recover a 1-σ that matches what NAV-COV would have reported.
+      double sigma_h = h_acc_m / HACC_TO_SIGMA;
+      double sigma_v = v_acc_m / HACC_TO_SIGMA;
+      double sigma_h_sq = sigma_h * sigma_h;
+      double sigma_v_sq = sigma_v * sigma_v;
       // Row-major ENU diagonal (xx, yy, zz at [0], [4], [8]); off-diagonals 0
       nav_sat_fix_msg.position_covariance = {
         sigma_h_sq, 0.0, 0.0,
@@ -210,6 +240,7 @@ private:
     cached_enu_pos_cov_[8] = ubx_cov_msg->pos_cov_dd;
 
     cached_cov_itow_ = ubx_cov_msg->itow;
+    cached_cov_stamp_ = ubx_cov_msg->header.stamp;
     have_cached_cov_ = true;
   }
 
