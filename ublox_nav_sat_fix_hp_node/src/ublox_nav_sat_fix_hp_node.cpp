@@ -42,7 +42,7 @@ public:
   {
     RCLCPP_INFO(this->get_logger(), "starting %s", get_name());
 
-    enu_pos_cov_.fill(0.0);  // initialise values to zero
+    cached_enu_pos_cov_.fill(0.0);
 
     auto qos = rclcpp::SensorDataQoS();
     rclcpp::PublisherOptions pub_options;
@@ -67,62 +67,138 @@ public:
   ~UbloxNavSatHpFixNode() {RCLCPP_INFO(this->get_logger(), "finished");}
 
 private:
-  // void nav_hp_pos_llh_callback(const ublox_ubx_msgs::msg::UBXNavHPPosLLH::SharedPtr llh_msg);
-  // void nav_cov_callback(const ublox_ubx_msgs::msg::UBXNavCov::SharedPtr nav_cov_msg);
-  // void nav_sta_callback(const ublox_ubx_msgs::msg::UBXNavStatus::SharedPtr nav_sta_msg);
-
   rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr nav_sat_fix_pub_;
 
   rclcpp::Subscription<ublox_ubx_msgs::msg::UBXNavHPPosLLH>::SharedPtr ubx_nav_hp_pos_llh_sub_;
   rclcpp::Subscription<ublox_ubx_msgs::msg::UBXNavCov>::SharedPtr ubx_nav_cov_sub_;
   rclcpp::Subscription<ublox_ubx_msgs::msg::UBXNavStatus>::SharedPtr ubx_nav_status_sub_;
 
-  // std::vector<double> enu_covariance_diagonal_;
-  std::array<double, POS_COV_ARR_SIZE> enu_pos_cov_;
-  sensor_msgs::msg::NavSatStatus nav_sat_stat_;
+  // Cached values from the NAV-COV and NAV-STATUS streams. These two messages
+  // are emitted at the end of the F9P's per-epoch UBX output sequence and are
+  // routinely dropped by the receiver's internal USB tx buffer when bigger
+  // messages (NAV-SAT, NAV-SIG, NMEA-GGA) co-occur — in practice we observed
+  // NAV-STATUS arriving at ~3 Hz and NAV-COV at ~1 Hz when configured at 7 Hz.
+  //
+  // Each cached value is tagged with the iTOW of the epoch it came from.
+  // - STATUS is treated as fast-changing (carr_soln can flip on a single
+  //   cycle slip): require an exact iTOW match before reusing the cached
+  //   status, otherwise classify from per-epoch h_acc.
+  // - COV is treated as slow-changing: keep using the cached NED→ENU matrix
+  //   even when its iTOW is older than the current HPPOSLLH, as long as it's
+  //   recent enough (<= STALE_COV_THRESHOLD_S). Only fall back to an
+  //   h_acc-derived diagonal when NAV-COV is genuinely missing or stale.
+  //
+  // hAcc / vAcc from HPPOSLLH are ~95 % confidence estimates ≈ 2.45 × the
+  // 1-σ that NAV-COV reports for the same epoch. Empirically on an F9P
+  // with RTK-Fixed: NAV-COV σ ≈ 4-7 mm vs hAcc ≈ 14 mm. The fallback divides
+  // by HACC_TO_SIGMA so it produces a covariance compatible with NAV-COV
+  // rather than ~6× over-stated.
+  static constexpr double HACC_TO_SIGMA = 2.45;
+  static constexpr double STALE_COV_THRESHOLD_S = 5.0;
 
-  // flags used to check whether we have received corresponding messages
-  bool have_recd_enu_pos_cov_ = false;
+  std::array<double, POS_COV_ARR_SIZE> cached_enu_pos_cov_;
+  uint32_t cached_cov_itow_ = 0;
+  rclcpp::Time cached_cov_stamp_;
+  bool have_cached_cov_ = false;
+
+  sensor_msgs::msg::NavSatStatus cached_nav_sat_stat_;
+  uint32_t cached_status_itow_ = 0;
+  bool have_cached_status_ = false;
 
   UBLOX_NAV_SAT_FIX_HP_NODE_LOCAL
   void nav_hp_pos_llh_callback(
     const ublox_ubx_msgs::msg::UBXNavHPPosLLH::SharedPtr ubx_hppos_llh_msg)
   {
-    // Create the NavSatFix message
+    // Drop epochs the receiver flagged as invalid. Without this gate the HP
+    // node would still publish a (likely bogus) lat/lon, attached to whatever
+    // status was last cached — which in practice means a junk position with
+    // STATUS_GBAS_FIX glued on if the prior epoch was Fixed.
+    if (ubx_hppos_llh_msg->invalid_lat || ubx_hppos_llh_msg->invalid_lon ||
+      ubx_hppos_llh_msg->invalid_lat_hp || ubx_hppos_llh_msg->invalid_lon_hp)
+    {
+      RCLCPP_DEBUG(
+        this->get_logger(), "dropping HPPOSLLH with invalid lat/lon flags (iTOW %u)",
+        ubx_hppos_llh_msg->itow);
+      return;
+    }
+
     sensor_msgs::msg::NavSatFix nav_sat_fix_msg;
-    // header - copy from Pos message
     nav_sat_fix_msg.header = ubx_hppos_llh_msg->header;
-    // copy status from previous nav_sat_stat message
-    nav_sat_fix_msg.status = nav_sat_stat_;
 
     // Extract the LLH and high-precision components
     double lat = ubx_hppos_llh_msg->lat * 1e-7 + ubx_hppos_llh_msg->lat_hp * 1e-9;
     double lon = ubx_hppos_llh_msg->lon * 1e-7 + ubx_hppos_llh_msg->lon_hp * 1e-9;
     double alt = ubx_hppos_llh_msg->height * 1e-3 + ubx_hppos_llh_msg->height_hp * 1e-4;
+    nav_sat_fix_msg.latitude = lat;
+    nav_sat_fix_msg.longitude = lon;
+    nav_sat_fix_msg.altitude = alt;
 
-    // Convert the LLH position and covariance values to NavSatFix message format
-    nav_sat_fix_msg.latitude = lat;   // Degrees
-    nav_sat_fix_msg.longitude = lon;  // Degrees
-    nav_sat_fix_msg.altitude = alt;   // meters
+    // h_acc / v_acc are uint32 in units of 0.1 mm (per UBX-NAV-HPPOSLLH spec).
+    // Always present, always per-epoch — these are the receiver's own
+    // estimate of the current solution accuracy and don't suffer the
+    // bandwidth-induced drop of NAV-STATUS / NAV-COV.
+    double h_acc_m = ubx_hppos_llh_msg->h_acc * 1e-4;
+    double v_acc_m = ubx_hppos_llh_msg->v_acc * 1e-4;
 
-    // Fill in covariance data
-    if (nav_sat_fix_msg.position_covariance.size() != enu_pos_cov_.size()) {
-      RCLCPP_ERROR(
-        this->get_logger(), "Size mismatch betwwen NavSatFix covariance data and EnuPosCov data");
-      return;
-    }
-    for (size_t i = 0; i < enu_pos_cov_.size(); i++) {
-      nav_sat_fix_msg.position_covariance[i] = enu_pos_cov_[i];
-    }
-    if (have_recd_enu_pos_cov_) {
-      // Set covariance type to estimated from the converted NED to ENU covariance
-      nav_sat_fix_msg.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_KNOWN;
+    // Status. Prefer the receiver's own NAV-STATUS classification (which
+    // distinguishes RTK Fixed / Float / DGPS / autonomous) when its iTOW
+    // matches this epoch — carr_soln can flip on a single cycle slip so a
+    // strict match is what protects against publishing a Float-position
+    // tagged with a stale Fixed status. When NAV-STATUS was dropped for
+    // this epoch, classify by h_acc as a fallback: RTK Fixed typically
+    // reports h_acc 3-30 mm, Float / DGPS 100 mm-2 m, autonomous 1-5 m+.
+    if (have_cached_status_ && cached_status_itow_ == ubx_hppos_llh_msg->itow) {
+      nav_sat_fix_msg.status = cached_nav_sat_stat_;
     } else {
-      nav_sat_fix_msg.position_covariance_type =
-        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
+      sensor_msgs::msg::NavSatStatus status;
+      status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
+      if (h_acc_m < 0.050) {
+        status.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
+      } else if (h_acc_m < 2.000) {
+        status.status = sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
+      } else {
+        status.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
+      }
+      nav_sat_fix_msg.status = status;
     }
 
-    // Publish NavSatFix message
+    // Position covariance. NAV-COV is slow-changing (relative to the per-epoch
+    // position): reuse the last cached NED→ENU matrix as long as it's recent
+    // (within STALE_COV_THRESHOLD_S). Only synthesise an h_acc-based diagonal
+    // when NAV-COV has never been received or is genuinely stale — this
+    // avoids /fix.position_covariance flickering between the receiver's tight
+    // NAV-COV (σ ≈ 5 mm) and a conservative h_acc fallback every time
+    // NAV-COV drops a message.
+    bool cov_is_fresh = false;
+    if (have_cached_cov_) {
+      double age_s = (ubx_hppos_llh_msg->header.stamp.sec +
+        ubx_hppos_llh_msg->header.stamp.nanosec * 1e-9) -
+        (cached_cov_stamp_.seconds());
+      cov_is_fresh = age_s < STALE_COV_THRESHOLD_S;
+    }
+    if (cov_is_fresh) {
+      for (size_t i = 0; i < cached_enu_pos_cov_.size(); i++) {
+        nav_sat_fix_msg.position_covariance[i] = cached_enu_pos_cov_[i];
+      }
+      nav_sat_fix_msg.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_KNOWN;
+    } else {
+      // hAcc / vAcc are ~95 % confidence radii on F9P, so divide by ~2.45
+      // to recover a 1-σ that matches what NAV-COV would have reported.
+      double sigma_h = h_acc_m / HACC_TO_SIGMA;
+      double sigma_v = v_acc_m / HACC_TO_SIGMA;
+      double sigma_h_sq = sigma_h * sigma_h;
+      double sigma_v_sq = sigma_v * sigma_v;
+      // Row-major ENU diagonal (xx, yy, zz at [0], [4], [8]); off-diagonals 0
+      nav_sat_fix_msg.position_covariance = {
+        sigma_h_sq, 0.0, 0.0,
+        0.0, sigma_h_sq, 0.0,
+        0.0, 0.0, sigma_v_sq,
+      };
+      nav_sat_fix_msg.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+    }
+
     nav_sat_fix_pub_->publish(nav_sat_fix_msg);
 
     RCLCPP_DEBUG(
@@ -152,19 +228,20 @@ private:
     //         |-Ped -Pnd  Pdd |
 
     // Tranform the covariance matrix from NED to ENU format in row-major order
-    static_assert(POS_COV_ARR_SIZE == 9, "size of enu_pos_cov_ must be 9");
-    enu_pos_cov_[0] = ubx_cov_msg->pos_cov_ee;
-    enu_pos_cov_[1] = ubx_cov_msg->pos_cov_ne;
-    enu_pos_cov_[2] = -ubx_cov_msg->pos_cov_ed;
-    enu_pos_cov_[3] = ubx_cov_msg->pos_cov_ne;
-    enu_pos_cov_[4] = ubx_cov_msg->pos_cov_nn;
-    enu_pos_cov_[5] = -ubx_cov_msg->pos_cov_nd;
-    enu_pos_cov_[6] = -ubx_cov_msg->pos_cov_ed;
-    enu_pos_cov_[7] = -ubx_cov_msg->pos_cov_nd;
-    enu_pos_cov_[8] = ubx_cov_msg->pos_cov_dd;
+    static_assert(POS_COV_ARR_SIZE == 9, "size of cached_enu_pos_cov_ must be 9");
+    cached_enu_pos_cov_[0] = ubx_cov_msg->pos_cov_ee;
+    cached_enu_pos_cov_[1] = ubx_cov_msg->pos_cov_ne;
+    cached_enu_pos_cov_[2] = -ubx_cov_msg->pos_cov_ed;
+    cached_enu_pos_cov_[3] = ubx_cov_msg->pos_cov_ne;
+    cached_enu_pos_cov_[4] = ubx_cov_msg->pos_cov_nn;
+    cached_enu_pos_cov_[5] = -ubx_cov_msg->pos_cov_nd;
+    cached_enu_pos_cov_[6] = -ubx_cov_msg->pos_cov_ed;
+    cached_enu_pos_cov_[7] = -ubx_cov_msg->pos_cov_nd;
+    cached_enu_pos_cov_[8] = ubx_cov_msg->pos_cov_dd;
 
-    // set flag to show we have received fresh data for this message
-    have_recd_enu_pos_cov_ = true;
+    cached_cov_itow_ = ubx_cov_msg->itow;
+    cached_cov_stamp_ = ubx_cov_msg->header.stamp;
+    have_cached_cov_ = true;
   }
 
   UBLOX_NAV_SAT_FIX_HP_NODE_LOCAL
@@ -176,7 +253,7 @@ private:
       case ublox_ubx_msgs::msg::GpsFix::GPS_NO_FIX:
       case ublox_ubx_msgs::msg::GpsFix::GPS_TIME_ONLY:
       case ublox_ubx_msgs::msg::GpsFix::GPS_DEAD_RECKONING_ONLY:
-        nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
+        cached_nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
         break;
       case ublox_ubx_msgs::msg::GpsFix::GPS_FIX_2D:
       case ublox_ubx_msgs::msg::GpsFix::GPS_FIX_3D:
@@ -184,21 +261,24 @@ private:
         if (ubx_sta_msg->carr_soln.status ==
           ublox_ubx_msgs::msg::CarrSoln::CARRIER_SOLUTION_PHASE_WITH_FIXED_AMBIGUITIES)
         {
-          nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
+          cached_nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
         } else if (ubx_sta_msg->diff_soln) {  // diff corrections were applied
-          nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
+          cached_nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
         } else {
-          nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
+          cached_nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
         }
         break;
       default:
-        nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
+        cached_nav_sat_stat_.status = sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
         break;
     }
 
     // Service values - derive from UBX-NAV-SAT gnssId field?
     // In their absence, use arrogant default assumption of GPS
-    nav_sat_stat_.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
+    cached_nav_sat_stat_.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
+
+    cached_status_itow_ = ubx_sta_msg->itow;
+    have_cached_status_ = true;
   }
 };
 
